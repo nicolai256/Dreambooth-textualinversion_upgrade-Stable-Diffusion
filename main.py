@@ -1,3 +1,9 @@
+#textual inversion
+
+import sys
+sys.path.append('./taming-transformers')
+sys.path.append('./clip')
+
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import time
@@ -10,7 +16,7 @@ from packaging import version
 from omegaconf import OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -20,10 +26,20 @@ from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
+###############windows mods##################
+import os
+os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
+#PL_TORCH_DISTRIBUTED_BACKEND=gloo
+torch.autograd.set_detect_anomaly(True)
+def get_font(txt, img_fraction=0.05):
+    font = ImageFont.truetype("/Library/fonts/Arial.ttf", fontsize)
+#############################################
 
+
+#script
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
+    pl_sd = torch.load(ckpt, map_location="cuda")
     sd = pl_sd["state_dict"]
     config.model.params.ckpt_path = ckpt
     model = instantiate_from_config(config.model)
@@ -133,8 +149,8 @@ def get_parser(**parser_kwargs):
         "--scale_lr",
         type=str2bool,
         nargs="?",
-        const=False,
-        default=False,
+        const=True,
+        default=True,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
     )
 
@@ -146,34 +162,13 @@ def get_parser(**parser_kwargs):
         default=True, 
         help="Prepend the final directory in the data_root to the output directory name")
 
-    parser.add_argument("--actual_resume", 
-        type=str,
-        required=True,
-        help="Path to model to actually resume from")
+    parser.add_argument("--actual_resume", type=str, default="", help="Path to model to actually resume from")
+    parser.add_argument("--data_root", type=str, required=True, help="Path to directory with training images")
 
-    parser.add_argument("--data_root", 
-        type=str, 
-        required=True, 
-        help="Path to directory with training images")
-    
-    parser.add_argument("--reg_data_root", 
-        type=str, 
-        required=True, 
-        help="Path to directory with regularization images")
+    parser.add_argument("--embedding_manager_ckpt", type=str, default="", help="Initialize embedding manager from a checkpoint")
+    parser.add_argument("--placeholder_tokens", type=str, nargs="+", default=["*"])
 
-    parser.add_argument("--embedding_manager_ckpt", 
-        type=str, 
-        default="", 
-        help="Initialize embedding manager from a checkpoint")
-
-    parser.add_argument("--class_word", 
-        type=str, 
-        default="dog",
-        help="Placeholder token which will be used to denote the concept in future prompts")
-
-    parser.add_argument("--init_word", 
-        type=str, 
-        help="Word to use as source for initial token embedding")
+    parser.add_argument("--init_word", type=str, help="Word to use as source for initial token embedding.")
 
     return parser
 
@@ -213,18 +208,9 @@ def worker_init_fn(_):
     else:
         return np.random.seed(np.random.get_state()[1][0] + worker_id)
 
-class ConcatDataset(Dataset):
-    def __init__(self, *datasets):
-        self.datasets = datasets
 
-    def __getitem__(self, idx):
-        return tuple(d[idx] for d in self.datasets)
-
-    def __len__(self):
-        return min(len(d) for d in self.datasets)
-    
 class DataModuleFromConfig(pl.LightningDataModule):
-    def __init__(self, batch_size, train=None, reg = None, validation=None, test=None, predict=None,
+    def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
                  wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
                  shuffle_val_dataloader=False):
         super().__init__()
@@ -234,11 +220,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self.use_worker_init_fn = use_worker_init_fn
         if train is not None:
             self.dataset_configs["train"] = train
-        if reg is not None:
-            self.dataset_configs["reg"] = reg
-        
-        self.train_dataloader = self._train_dataloader
-        
+            self.train_dataloader = self._train_dataloader
         if validation is not None:
             self.dataset_configs["validation"] = validation
             self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
@@ -268,10 +250,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             init_fn = worker_init_fn
         else:
             init_fn = None
-        train_set = self.datasets["train"]
-        reg_set = self.datasets["reg"]
-        concat_dataset = ConcatDataset(train_set, reg_set)
-        return DataLoader(concat_dataset, batch_size=self.batch_size,
+        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
                           worker_init_fn=init_fn)
 
@@ -387,11 +366,17 @@ class ImageLogger(Callback):
             pl_module.logger.experiment.add_image(
                 tag, grid,
                 global_step=pl_module.global_step)
-
+                
+               
+    #base_counter += 1
     @rank_zero_only
     def log_local(self, save_dir, split, images,
                   global_step, current_epoch, batch_idx):
+        global base_counter
         root = os.path.join(save_dir, "images", split)
+        os.makedirs(os.path.split(os.path.join(root))[0], exist_ok=True)
+        os.makedirs(os.path.split(os.path.join(root, "train", split))[0], exist_ok=True)
+        base_counter = len(os.listdir(root)) 
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
             if self.rescale:
@@ -399,14 +384,20 @@ class ImageLogger(Callback):
             grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
             grid = grid.numpy()
             grid = (grid * 255).astype(np.uint8)
-            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.jpg".format(
+            base_counter += 1
+            filename = "{}_gs-{:06}_e-{:06}_b-{:06}_{:08}.png".format(
                 k,
                 global_step,
                 current_epoch,
-                batch_idx)
-            path = os.path.join(root, filename)
-            os.makedirs(os.path.split(path)[0], exist_ok=True)
-            Image.fromarray(grid).save(path)
+                batch_idx,
+                base_counter)
+
+            Image.fromarray(grid).save(
+                                    os.path.join(root, filename))
+            
+            os.makedirs(os.path.split(os.path.join(root, filename))[0], exist_ok=True)
+            Image.fromarray(grid).save(os.path.join(root, filename))
+            
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
@@ -484,7 +475,7 @@ class CUDACallback(Callback):
             rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
         except AttributeError:
             pass
-
+            
 class ModeSwapCallback(Callback):
 
     def __init__(self, swap_step=2000):
@@ -500,6 +491,7 @@ class ModeSwapCallback(Callback):
         if trainer.global_step > self.swap_step and self.is_frozen:
             self.is_frozen = False
             trainer.optimizers = [pl_module.configure_opt_model()]
+
 
 if __name__ == "__main__":
     # custom parser to specify config files, train, test and debug mode,
@@ -624,15 +616,11 @@ if __name__ == "__main__":
         # model
 
         # config.model.params.personalization_config.params.init_word = opt.init_word
-        # config.model.params.personalization_config.params.embedding_manager_ckpt = opt.embedding_manager_ckpt
-        # config.model.params.personalization_config.params.placeholder_tokens = opt.placeholder_tokens
+        config.model.params.personalization_config.params.embedding_manager_ckpt = opt.embedding_manager_ckpt
+        config.model.params.personalization_config.params.placeholder_tokens = opt.placeholder_tokens
 
-        # if opt.init_word:
-        #     config.model.params.personalization_config.params.initializer_words[0] = opt.init_word
-            
-        config.data.params.train.params.placeholder_token = opt.class_word
-        config.data.params.reg.params.placeholder_token = opt.class_word
-        config.data.params.validation.params.placeholder_token = opt.class_word
+        if opt.init_word:
+            config.model.params.personalization_config.params.initializer_words[0] = opt.init_word
 
         if opt.actual_resume:
             model = load_model_from_config(config, opt.actual_resume)
@@ -668,6 +656,9 @@ if __name__ == "__main__":
             logger_cfg = OmegaConf.create()
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
         trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
+        
+        #global base_counter
+        #base_counter += 1
 
         # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
         # specify which metric is used to determine best models
@@ -675,7 +666,8 @@ if __name__ == "__main__":
             "target": "pytorch_lightning.callbacks.ModelCheckpoint",
             "params": {
                 "dirpath": ckptdir,
-                "filename": "{epoch:06}",
+                "filename": "gs-{global_step:06}_e-{epoch:06}",
+                "every_n_train_steps": 500,
                 "verbose": True,
                 "save_last": True,
             }
@@ -767,7 +759,6 @@ if __name__ == "__main__":
 
         # data
         config.data.params.train.params.data_root = opt.data_root
-        config.data.params.reg.params.data_root = opt.reg_data_root
         config.data.params.validation.params.data_root = opt.data_root
         data = instantiate_from_config(config.data)
 
@@ -784,7 +775,11 @@ if __name__ == "__main__":
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            #ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            if isinstance(lightning_config.trainer.gpus, int):
+                ngpu = lightning_config.trainer.gpus
+            else:
+                ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
         else:
             ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:
@@ -821,8 +816,8 @@ if __name__ == "__main__":
 
         import signal
 
-        signal.signal(signal.SIGUSR1, melk)
-        signal.signal(signal.SIGUSR2, divein)
+        signal.signal(signal.SIGTERM, melk)
+        signal.signal(signal.SIGTERM, divein)
 
         # run
         if opt.train:
@@ -848,5 +843,5 @@ if __name__ == "__main__":
             dst = os.path.join(dst, "debug_runs", name)
             os.makedirs(os.path.split(dst)[0], exist_ok=True)
             os.rename(logdir, dst)
-        if trainer.global_rank == 0:
-            print(trainer.profiler.summary())
+        #if trainer.global_rank == 0:
+        #    print(trainer.profiler.summary())
