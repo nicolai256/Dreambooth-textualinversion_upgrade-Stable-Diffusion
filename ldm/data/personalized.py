@@ -7,12 +7,8 @@ from torchvision import transforms
 
 import random
 
-training_templates_smallest = [
-    'photo of a sks {}',
-]
-
-reg_templates_smallest = [
-    'photo of a {}',
+imagenet_templates_smallest = [
+    'a photo of a {}',
 ]
 
 imagenet_templates_small = [
@@ -43,60 +39,6 @@ imagenet_templates_small = [
     'a photo of the large {}',
     'a photo of a cool {}',
     'a photo of a small {}',
-    'an illustration of a {}',
-    'a rendering of a {}',
-    'a cropped photo of the {}',
-    'the photo of a {}',
-    'an illustration of a clean {}',
-    'an illustration of a dirty {}',
-    'a dark photo of the {}',
-    'an illustration of my {}',
-    'an illustration of the cool {}',
-    'a close-up photo of a {}',
-    'a bright photo of the {}',
-    'a cropped photo of a {}',
-    'an illustration of the {}',
-    'a good photo of the {}',
-    'an illustration of one {}',
-    'a close-up photo of the {}',
-    'a rendition of the {}',
-    'an illustration of the clean {}',
-    'a rendition of a {}',
-    'an illustration of a nice {}',
-    'a good photo of a {}',
-    'an illustration of the nice {}',
-    'an illustration of the small {}',
-    'an illustration of the weird {}',
-    'an illustration of the large {}',
-    'an illustration of a cool {}',
-    'an illustration of a small {}',
-    'a depiction of a {}',
-    'a rendering of a {}',
-    'a cropped photo of the {}',
-    'the photo of a {}',
-    'a depiction of a clean {}',
-    'a depiction of a dirty {}',
-    'a dark photo of the {}',
-    'a depiction of my {}',
-    'a depiction of the cool {}',
-    'a close-up photo of a {}',
-    'a bright photo of the {}',
-    'a cropped photo of a {}',
-    'a depiction of the {}',
-    'a good photo of the {}',
-    'a depiction of one {}',
-    'a close-up photo of the {}',
-    'a rendition of the {}',
-    'a depiction of the clean {}',
-    'a rendition of a {}',
-    'a depiction of a nice {}',
-    'a good photo of a {}',
-    'a depiction of the nice {}',
-    'a depiction of the small {}',
-    'a depiction of the weird {}',
-    'a depiction of the large {}',
-    'a depiction of a cool {}',
-    'a depiction of a small {}',
 ]
 
 imagenet_dual_templates_small = [
@@ -141,12 +83,11 @@ class PersonalizedBase(Dataset):
                  interpolation="bicubic",
                  flip_p=0.5,
                  set="train",
-                 placeholder_token="dog",
+                 placeholder_token="*",
                  per_image_tokens=False,
                  center_crop=False,
                  mixing_prob=0.25,
                  coarse_class_text=None,
-                 reg = False
                  ):
 
         self.data_root = data_root
@@ -155,7 +96,7 @@ class PersonalizedBase(Dataset):
 
         # self._length = len(self.image_paths)
         self.num_images = len(self.image_paths)
-        self._length = self.num_images 
+        self._length = self.num_images
 
         self.placeholder_token = placeholder_token
 
@@ -178,7 +119,6 @@ class PersonalizedBase(Dataset):
                               "lanczos": PIL.Image.LANCZOS,
                               }[interpolation]
         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
-        self.reg = reg
 
     def __len__(self):
         return self._length
@@ -187,23 +127,36 @@ class PersonalizedBase(Dataset):
         example = {}
         image = Image.open(self.image_paths[i % self.num_images])
 
-        if not image.mode == "RGB":
-            image = image.convert("RGB")
-
         placeholder_string = self.placeholder_token
         if self.coarse_class_text:
             placeholder_string = f"{self.coarse_class_text} {placeholder_string}"
 
-        if not self.reg:
-            text = random.choice(training_templates_smallest).format(placeholder_string)
-        else:
-            text = random.choice(reg_templates_smallest).format(placeholder_string)
-            
+        image = image.convert('RGBA')
+        new_image = Image.new('RGBA', image.size, 'WHITE')
+        new_image.paste(image, (0, 0), image)
+        image = new_image.convert('RGB')
+
+        templates = [
+            'a {} portrait of {}',
+            'an {} image of {}',
+            'a {} pretty picture of {}',
+            'a {} clip art picture of {}',
+            'an {} illustration of {}',
+            'a {} 3D render of {}',
+            'a {} {}',
+        ]
+
+        filename = os.path.basename(self.image_paths[i % self.num_images])
+        filename_tokens = os.path.splitext(filename)[0].replace(' ', '-').replace('_', '-').split('-')
+        filename_tokens = [token for token in filename_tokens if token.isalpha()]
+
+        text = random.choice(templates).format(' '.join(filename_tokens), self.placeholder_token)
+
         example["caption"] = text
 
         # default to score-sde preprocessing
         img = np.array(image).astype(np.uint8)
-        
+
         if self.center_crop:
             crop = min(img.shape[0], img.shape[1])
             h, w, = img.shape[0], img.shape[1]

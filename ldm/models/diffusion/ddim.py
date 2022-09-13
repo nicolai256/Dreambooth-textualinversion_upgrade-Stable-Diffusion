@@ -1,5 +1,5 @@
 """SAMPLING ONLY."""
-
+import sys
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -119,8 +119,9 @@ class DDIMSampler(object):
                       unconditional_guidance_scale=1., unconditional_conditioning=None,):
         device = self.model.betas.device
         b = shape[0]
+        
         if x_T is None:
-            img = torch.randn(shape, device=device)
+                img = torch.randn(shape, device=device) #original line actually
         else:
             img = x_T
 
@@ -138,6 +139,10 @@ class DDIMSampler(object):
         iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
         for i, step in enumerate(iterator):
+        
+            sys.stdout.write(f'Iteration {i}\n')
+            sys.stdout.flush()
+        
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -231,8 +236,13 @@ class DDIMSampler(object):
         print(f"Running DDIM Sampling with {total_steps} timesteps")
 
         iterator = tqdm(time_range, desc='Decoding image', total=total_steps)
+        #iterator = range(total_steps)
         x_dec = x_latent
         for i, step in enumerate(iterator):
+        
+            sys.stdout.write(f'Iteration {i}\n')
+            sys.stdout.flush()
+        
             index = total_steps - i - 1
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
             x_dec, _ = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,

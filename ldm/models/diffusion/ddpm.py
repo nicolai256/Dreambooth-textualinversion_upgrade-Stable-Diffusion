@@ -444,10 +444,7 @@ class LatentDiffusion(DDPM):
                  conditioning_key=None,
                  scale_factor=1.0,
                  scale_by_std=False,
-                 reg_weight = 1.0,
                  *args, **kwargs):
-        
-        self.reg_weight = reg_weight
 
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -496,8 +493,10 @@ class LatentDiffusion(DDPM):
             for param in self.model.parameters():
                 param.requires_grad = False
         
-        self.embedding_manager = None
+        self.embedding_manager = self.instantiate_embedding_manager(personalization_config, self.cond_stage_model)
 
+        for param in self.embedding_manager.embedding_parameters():
+            param.requires_grad = True
 
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -560,13 +559,13 @@ class LatentDiffusion(DDPM):
             self.cond_stage_model = model
             
     
-    # def instantiate_embedding_manager(self, config, embedder):
-    #     model = instantiate_from_config(config, embedder=embedder)
+    def instantiate_embedding_manager(self, config, embedder):
+        model = instantiate_from_config(config, embedder=embedder)
 
-    #     if config.params.get("embedding_manager_ckpt", None): # do not load if missing OR empty string
-    #         model.load(config.params.embedding_manager_ckpt)
+        if config.params.get("embedding_manager_ckpt", None): # do not load if missing OR empty string
+            model.load(config.params.embedding_manager_ckpt)
         
-    #     return model
+        return model
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
         denoise_row = []
@@ -907,27 +906,6 @@ class LatentDiffusion(DDPM):
         x, c = self.get_input(batch, self.first_stage_key)
         loss = self(x, c)
         return loss
-    
-    def training_step(self, batch, batch_idx):
-        train_batch = batch[0]
-        reg_batch = batch[1]
-        
-        loss_train, loss_dict = self.shared_step(train_batch)
-        loss_reg, _ = self.shared_step(reg_batch)
-        
-        loss = loss_train + self.reg_weight * loss_reg
-
-        self.log_dict(loss_dict, prog_bar=True,
-                      logger=True, on_step=True, on_epoch=True)
-
-        self.log("global_step", self.global_step,
-                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
-
-        if self.use_scheduler:
-            lr = self.optimizers().param_groups[0]['lr']
-            self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
-
-        return loss
 
     def forward(self, x, c, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
@@ -1105,13 +1083,13 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
 
-        # if self.embedding_reg_weight > 0:
-        #     loss_embedding_reg = self.embedding_manager.embedding_to_coarse_loss().mean()
+        if self.embedding_reg_weight > 0:
+            loss_embedding_reg = self.embedding_manager.embedding_to_coarse_loss().mean()
 
-        #     loss_dict.update({f'{prefix}/loss_emb_reg': loss_embedding_reg})
+            loss_dict.update({f'{prefix}/loss_emb_reg': loss_embedding_reg})
 
-        #     loss += (self.embedding_reg_weight * loss_embedding_reg)
-        #     loss_dict.update({f'{prefix}/loss': loss})
+            loss += (self.embedding_reg_weight * loss_embedding_reg)
+            loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
 
@@ -1325,7 +1303,6 @@ class LatentDiffusion(DDPM):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        batch = batch[0]
         z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
                                            return_first_stage_outputs=True,
                                            force_c_encode=True,
@@ -1459,7 +1436,7 @@ class LatentDiffusion(DDPM):
                 print('Diffusion model optimizing logvar')
                 params.append(self.logvar)
 
-            opt = torch.optim.AdamW(params, lr=lr)
+                opt = torch.optim.AdamW(params, lr=lr)
 
         return opt
 
@@ -1506,16 +1483,16 @@ class LatentDiffusion(DDPM):
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
 
-    # @rank_zero_only
-    # def on_save_checkpoint(self, checkpoint):
+    @rank_zero_only
+    def on_save_checkpoint(self, checkpoint):
 
-    #     if not self.unfreeze_model: # If we are not tuning the model itself, zero-out the checkpoint content to preserve memory.
-    #         checkpoint.clear()
+        if not self.unfreeze_model: # If we are not tuning the model itself, zero-out the checkpoint content to preserve memory.
+            checkpoint.clear()
         
-    #     if os.path.isdir(self.trainer.checkpoint_callback.dirpath):
-    #         self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, "embeddings.pt"))
+        if os.path.isdir(self.trainer.checkpoint_callback.dirpath):
+            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, "embeddings.pt"))
 
-    #         self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, f"embeddings_gs-{self.global_step}.pt"))
+            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, f"embeddings_gs-{self.global_step}.pt"))
 
 
 class DiffusionWrapper(pl.LightningModule):
